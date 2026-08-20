@@ -1,0 +1,1495 @@
+# ---------------- Package Good/NG Tester (Sensor-Driven, Modbus TCP IO) ----------------
+# Each package type has its OWN YOLO detection model. Selecting a package type loads
+# that package's model automatically.
+#
+# SEQUENCE:
+#   1. Select package type -> its matching best.pt model loads automatically
+#   2. Enter Operator ID + Lot Number, then click START
+#   3. While RUNNING, the system polls two Modbus TCP sensors every
+#      SENSOR_POLL_INTERVAL_MS:
+#        - Sensor1 OFF + Sensor2 ON  -> camera snaps + processes automatically
+#        - Sensor1 ON  + Sensor2 ON  -> no action (leadframe still loading)
+#        - Sensor1 OFF + Sensor2 OFF -> if held continuously for
+#          BOTH_OFF_HOLD_SECONDS (default 20s), "LOT IS FINISHED?" prompt
+#            YES -> system goes idle (re-enter Operator ID + Lot to resume)
+#            NO  -> keeps running, waiting for the next leadframe
+#   4. Images save to <BASE_DIRECTORY>\<LotNumber>\GOOD\ or \NG\
+#      (per-class "always save" toggles in Settings still apply on top of this)
+#   5. Any NG result (WRONG ORIENTATION / BROKEN LEAD / etc.) sends a stop
+#      signal via a Modbus TCP coil write - the replacement for the mechanical
+#      relay used previously.
+#
+# The SNAP (S) button / key still works as a manual override for testing or
+# simulation, independent of the sensor-driven flow above.
+#
+# Uses a Modbus TCP / Ethernet IO module (e.g. a PoE Modbus TCP 8CH unit) for
+# sensor reads and the stop-signal output - NOT Modbus RTU (serial). Requires:
+# pip install pymodbus
+
+import cv2
+import numpy as np
+import os
+import time
+import json
+import re
+from datetime import datetime
+import tkinter as tk
+from tkinter import ttk, messagebox, font
+from PIL import Image, ImageTk
+from ultralytics import YOLO
+
+try:
+    from pymodbus.client import ModbusTcpClient
+    PYMODBUS_AVAILABLE = True
+except ImportError:
+    PYMODBUS_AVAILABLE = False
+    print("[SETUP] pymodbus not installed - sensor/IO features will be disabled. "
+          "Run: pip install pymodbus")
+
+# ---------------- Configuration ----------------
+
+# Webcam index. 0 is usually the built-in/first webcam. Try 1, 2... if wrong camera opens.
+CAMERA_INDEX = 0
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 720
+
+# Folder where all the per-package model files live.
+MODELS_DIRECTORY = r"C:\Users\EOLmaint\OneDrive\Documents\Python"
+
+# Each package type's own YOLO DETECTION model (two classes: GOOD / NG).
+# File names below are examples - rename your .pt files to match, or edit these paths.
+MODEL_PATHS = {
+    "MSOP_8LD": os.path.join(MODELS_DIRECTORY, "MSOP_8LD_best.pt"),
+    "MSOP_10LD": os.path.join(MODELS_DIRECTORY, "MSOP_10LD_best.pt"),
+    "MSOP_12LD": os.path.join(MODELS_DIRECTORY, "MSOP_12LD_best.pt"),
+    "MSOP_16LD": os.path.join(MODELS_DIRECTORY, "MSOP_16LD_best.pt"),
+    "S16W": os.path.join(MODELS_DIRECTORY, "S16W_Lead_best.pt"),
+}
+
+# Cache of already-loaded models, keyed by package type, so we don't reload from disk
+# every time the same package is re-selected.
+loaded_models = {}   # { package_type: YOLO(...) }
+current_model = None  # the YOLO model object for the currently selected package
+current_model_classes = {}  # e.g. {0: 'GOOD ORIENTATION', 1: 'WRONG ORIENTATION'} for the currently selected package
+
+# Base directory for saved images. Actual save path is built per-Lot at runtime:
+#   <BASE_DIRECTORY>\<LotNumber>\GOOD\   and   <BASE_DIRECTORY>\<LotNumber>\NG\
+# matching the example given: C:\Users\EOLmaint\Documents\Python\123456.7\GOOD
+BASE_DIRECTORY = r"C:\Users\EOLmaint\Documents\Python"
+
+
+def get_lot_save_dirs(lot_number):
+    """Return (good_dir, ng_dir) for the given Lot Number, creating them if
+    they don't exist yet. Called fresh each save, since the Lot Number can
+    change between runs (a new Lot = a new pair of folders).
+    Falls back to an 'UNASSIGNED_LOT' folder if lot_number is empty/None -
+    e.g. a manual SNAP test done before START/Lot entry."""
+    safe_lot = str(lot_number).strip() if lot_number else "UNASSIGNED_LOT"
+    lot_root = os.path.join(BASE_DIRECTORY, safe_lot)
+    good_dir = os.path.join(lot_root, "GOOD")
+    ng_dir = os.path.join(lot_root, "NG")
+    os.makedirs(good_dir, exist_ok=True)
+    os.makedirs(ng_dir, exist_ok=True)
+    return good_dir, ng_dir
+
+
+# Detection confidence threshold (adjustable via GUI).
+# Any detected unit below this confidence is ignored (not counted as a real unit).
+CLASS_CONF_THRESHOLD = 0.20
+
+# ---------------- Modbus TCP I/O configuration ----------------
+# Verified against Waveshare's official docs for THIS exact device
+# (Modbus POE ETH IO 8CH, SKU 33917): https://docs.waveshare.com/Modbus_POE_ETH_IO_8CH
+#
+# !!! IMPORTANT ONE-TIME SETUP - do this BEFORE running the script !!!
+# This module ships in Modbus RTU (transparent) mode by default, even though
+# it's Ethernet/PoE hardware. You must reconfigure it once using Waveshare's
+# "Vircom" Windows utility (free download from their product page):
+#   1. Vircom -> Device Management -> Auto Search -> select your device
+#   2. Advanced Options -> Conversion Protocol -> change "None" to "Modbus_TCP Protocol"
+#      (this also auto-switches the device's port to 502)
+#   3. More Advanced Settings -> Modbus Gateway Type -> "Non-storing Modbus Gateway"
+#      (their docs explicitly warn the default "Storing" type can overwhelm the
+#      microcontroller and break communication)
+#   4. Click "Modify Setting", then "Restart Device"
+# Only after this will the settings below actually work over Modbus TCP.
+#
+# Requires: pip install pymodbus
+MODBUS_HOST = "192.168.1.200"      # Waveshare factory default IP for this module -
+                                    # update if you changed it during Vircom setup
+MODBUS_PORT = 502                  # becomes 502 automatically once TCP protocol is enabled
+MODBUS_UNIT_ID = 1                 # device address 0x01 is this module's factory default
+
+# Digital input addresses (function code 02) for the two leadframe sensors.
+# Per Waveshare's register map: DI channel N -> address (N-1), range 0x0000-0x0007.
+# Defaults below assume Sensor 1 wired to DI1 and Sensor 2 wired to DI2 -
+# UPDATE if wired into different physical terminals.
+SENSOR1_INPUT_ADDR = 7             # DI8 = address 7 -> Sensor 1: leadframe detect
+SENSOR2_INPUT_ADDR = 6             # DI7 = address 6 -> Sensor 2: leadframe detect
+
+# Relay/coil address (function codes 01/05/0F) for the stop-machine output signal
+# (previously a mechanical relay; now a Modbus TCP coil write). Per the same
+# register map: relay channel N -> address (N-1). Default below assumes the
+# stop-signal relay is wired to DO1 - UPDATE if wired to a different channel.
+STOP_SIGNAL_COIL_ADDR = 0          # DO1 = address 0
+STOP_SIGNAL_PULSE_MS = 500         # how long to hold the stop signal ON, in milliseconds
+
+# How often (milliseconds) the system polls the two sensors while running
+SENSOR_POLL_INTERVAL_MS = 200
+
+# Both sensors must stay continuously OFF for this many seconds before the
+# "LOT IS FINISHED?" prompt triggers - a brief gap between leadframes should
+# NOT immediately ask the operator if the lot is done.
+BOTH_OFF_HOLD_SECONDS = 20
+
+# How long (seconds) to keep the frozen result frame on screen before returning to live preview
+RESULT_DISPLAY_SECONDS = 2.5
+
+# What text in the model's class names should be treated as the "Good" class.
+# Change this if your models' classes are named differently (e.g. "OK" / "NG",
+# "Pass" / "Fail", "good" / "ng"...).
+GOOD_CLASS_KEYWORDS = ("good", "ok", "pass")
+
+# Explicit "bad" keywords always win, even if a good keyword also matches
+# somewhere in the label. This is a safety net on top of the word-boundary
+# fix below - e.g. if someone later adds a class name where this could still
+# be ambiguous, an explicit bad/fail keyword takes precedence.
+BAD_CLASS_KEYWORDS = ("wrong", "broken", "ng", "bad", "fail", "defect")
+
+
+def is_good_label(label):
+    """Decide whether a class label counts as 'good', using WHOLE-WORD matching
+    only - not a loose substring check. A plain substring check is dangerous
+    here: "ok" in "broken lead" is True because "broken" contains the letters
+    "o" and "k" next to each other (br-OK-en), which would silently mark every
+    BROKEN LEAD detection as good. Word-boundary regex avoids that trap."""
+    label_lower = label.lower()
+
+    # Bad keywords always win first, as an extra safety net.
+    for kw in BAD_CLASS_KEYWORDS:
+        if re.search(r'\b' + re.escape(kw) + r'\b', label_lower):
+            return False
+
+    for kw in GOOD_CLASS_KEYWORDS:
+        if re.search(r'\b' + re.escape(kw) + r'\b', label_lower):
+            return True
+
+    return False  # unrecognized label - default to NOT good, safer for QC
+
+# Per-class box/label colors, in OpenCV's BGR order (Blue, Green, Red) - NOT RGB.
+# Match these keys (lowercase) to substrings of your actual class names.
+# Anything not matched here falls back to CLASS_COLOR_FALLBACK_GOOD/BAD below.
+CLASS_COLORS = {
+    "good orientation": (0, 200, 0),      # green
+    "wrong orientation": (0, 0, 255),     # red
+    "good lead":         (255, 200, 0),   # cyan/teal
+    "broken lead":       (0, 100, 255),   # orange
+}
+# Fallback colors if a class name doesn't match anything in CLASS_COLORS above
+CLASS_COLOR_FALLBACK_GOOD = (0, 200, 0)   # green
+CLASS_COLOR_FALLBACK_BAD = (0, 0, 255)    # red
+
+
+def get_class_color(label, is_good):
+    """Look up a distinct color for this specific class label.
+    Falls back to a generic good/bad color if the label isn't in CLASS_COLORS."""
+    label_lower = label.lower()
+    for key, color in CLASS_COLORS.items():
+        if key in label_lower:
+            return color
+    return CLASS_COLOR_FALLBACK_GOOD if is_good else CLASS_COLOR_FALLBACK_BAD
+
+# ---- ROI (Region of Interest) settings ----
+# If enabled, only the ROI_LEFT..ROI_RIGHT / ROI_TOP..ROI_BOTTOM region of the
+# frame is fed to the model. This helps ignore background clutter/edges outside
+# where packages actually sit. Set USE_ROI = False to disable and use the full frame.
+USE_ROI = True
+
+# ROI bounds as FRACTIONS of frame width/height (0.0-1.0), independently adjustable
+# per edge (not just a centered crop). Defaults below = central 80% box.
+# These can be changed live via Settings -> "Adjust ROI" (admin login required) and
+# are persisted to ROI_CONFIG_PATH so they survive a restart.
+ROI_LEFT = 0.1
+ROI_TOP = 0.1
+ROI_RIGHT = 0.9
+ROI_BOTTOM = 0.9
+
+# Credentials required to open the ROI adjustment screen. Hardcoded here for
+# simplicity - for a real production deployment, move these out of source code
+# (e.g. an environment variable or a separate local config file).
+ROI_ADMIN_USERNAME = "EOLmaint"
+ROI_ADMIN_PASSWORD = "EOLmaint123"
+
+ROI_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "roi_config.json")
+
+
+def load_roi_config():
+    """Load previously saved ROI bounds from disk, if present, overriding the
+    defaults above. Called once at startup."""
+    global ROI_LEFT, ROI_TOP, ROI_RIGHT, ROI_BOTTOM
+    try:
+        if os.path.exists(ROI_CONFIG_PATH):
+            with open(ROI_CONFIG_PATH, "r") as f:
+                cfg = json.load(f)
+            ROI_LEFT = float(cfg.get("left", ROI_LEFT))
+            ROI_TOP = float(cfg.get("top", ROI_TOP))
+            ROI_RIGHT = float(cfg.get("right", ROI_RIGHT))
+            ROI_BOTTOM = float(cfg.get("bottom", ROI_BOTTOM))
+            print(f"[SETUP] Loaded saved ROI config: "
+                  f"L={ROI_LEFT:.2f} T={ROI_TOP:.2f} R={ROI_RIGHT:.2f} B={ROI_BOTTOM:.2f}")
+    except Exception as e:
+        print(f"[SETUP] Could not load ROI config, using defaults: {e}")
+
+
+def save_roi_config():
+    """Persist the current ROI bounds to disk so they survive a restart."""
+    try:
+        with open(ROI_CONFIG_PATH, "w") as f:
+            json.dump({"left": ROI_LEFT, "top": ROI_TOP, "right": ROI_RIGHT, "bottom": ROI_BOTTOM}, f, indent=2)
+        print(f"[SETUP] Saved ROI config to {ROI_CONFIG_PATH}")
+    except Exception as e:
+        print(f"[SETUP] Could not save ROI config: {e}")
+
+
+load_roi_config()  # apply any previously saved ROI settings immediately
+
+# Whether the ROI boundary box is DRAWN on screen. This is independent of USE_ROI:
+# USE_ROI controls whether cropping actually happens for detection; this flag only
+# controls whether you SEE the yellow boundary box. Toggled live from the Settings
+# panel checkbox - this plain global is updated by that checkbox's command callback.
+SHOW_ROI_OVERLAY = True
+
+# Which result types get saved to disk. Toggled live from the Settings panel
+# checkboxes - these plain globals are updated by each checkbox's command callback.
+SAVE_GOOD_IMAGES = True
+SAVE_NG_IMAGES = True
+# Per-class "always save if this specific class appears" toggles, keyed by class
+# label text (e.g. "GOOD ORIENTATION", "BROKEN LEAD"). Populated dynamically once
+# a package's model is loaded and its class names are known. Off by default -
+# these are an extra opt-in capture, on top of the GOOD/NG toggles above.
+SAVE_CLASS_FLAGS = {}  # { class_label: bool }
+class_save_vars = {}   # { class_label: tk.BooleanVar } - the Tkinter-side counterpart
+
+# Expected number of units per frame (your annotations show 2 per image).
+# Used only for on-screen info / sanity-check messaging, not to force detection.
+EXPECTED_UNITS_PER_FRAME = 2
+
+# When True, every SNAP prints ALL raw model detections to the console,
+# including ones BELOW CLASS_CONF_THRESHOLD (which are normally discarded
+# silently). Useful for diagnosing "some units not detected" - it tells you
+# whether a missing unit was detected faintly (a threshold/scale issue) or
+# not detected at all (a training-data gap for that framing/scale).
+DEBUG_LOG_ALL_DETECTIONS = True
+
+# ---------------- System State ----------------
+selected_package = None
+last_result = None          # "GOOD" / "NG" / None
+last_reason = ""
+result_frame_display = None  # frame (annotated) currently shown, could be live or frozen result
+result_freeze_until = 0.0
+
+good_count = 0
+ng_count = 0
+last_process_time = 0.0
+last_inference_time = 0.0
+last_fps = 0.0
+
+video_capture = None
+gui_lock_frame = None  # last raw frame grabbed from camera (for classification)
+
+# ---- Operator / Lot / run-state (new sequence) ----
+current_operator_id = None
+current_lot_number = None
+SYSTEM_RUNNING = False           # True after START is clicked, False after STOP or Lot Finished
+
+modbus_client = None             # ModbusTcpClient instance, connected lazily on first use
+_prev_snap_condition = False     # edge-detection: was the "snap" sensor condition true last poll?
+_lot_finished_prompt_open = False  # prevents multiple "LOT IS FINISHED?" popups stacking
+_sensor_poll_job = None          # root.after() job id for the polling loop, so it can be cancelled
+_both_off_since = None           # wall-clock time.time() when both sensors first went OFF
+                                  # together, or None if they're not currently both OFF -
+                                  # used to require BOTH_OFF_HOLD_SECONDS before prompting
+
+
+def get_modbus_client():
+    """Return a connected ModbusTcpClient, (re)connecting if necessary.
+    Returns None if pymodbus isn't installed or the connection fails -
+    callers must handle that gracefully rather than crashing the app."""
+    global modbus_client
+    if not PYMODBUS_AVAILABLE:
+        return None
+    if modbus_client is not None and modbus_client.connected:
+        return modbus_client
+    try:
+        modbus_client = ModbusTcpClient(MODBUS_HOST, port=MODBUS_PORT)
+        if modbus_client.connect():
+            print(f"[MODBUS] Connected to {MODBUS_HOST}:{MODBUS_PORT}")
+            return modbus_client
+        else:
+            print(f"[MODBUS] Failed to connect to {MODBUS_HOST}:{MODBUS_PORT}")
+            return None
+    except Exception as e:
+        print(f"[MODBUS] Connection error: {e}")
+        return None
+
+
+def _modbus_call(method, *args, **kwargs):
+    """Call a pymodbus client method in a way that's safe across pymodbus
+    versions. The unit/slave identifier keyword was renamed from 'slave' to
+    'device_id' in newer pymodbus releases (confirmed: 3.15.0 uses
+    'device_id'; many still-common installs use 'slave'). This tries the
+    current name first and falls back automatically, so this script doesn't
+    silently break if the production machine has an older pymodbus pinned."""
+    try:
+        return method(*args, device_id=MODBUS_UNIT_ID, **kwargs)
+    except TypeError:
+        return method(*args, slave=MODBUS_UNIT_ID, **kwargs)
+
+
+def read_sensors():
+    """Read Sensor 1 and Sensor 2 states over Modbus TCP.
+    Returns (sensor1_on, sensor2_on) as booleans, or (None, None) if the
+    read failed (e.g. device unreachable) - callers must treat None as
+    'unknown state, do not act' rather than assuming OFF."""
+    client = get_modbus_client()
+    if client is None:
+        return None, None
+    try:
+        base = min(SENSOR1_INPUT_ADDR, SENSOR2_INPUT_ADDR)
+        count = abs(SENSOR2_INPUT_ADDR - SENSOR1_INPUT_ADDR) + 1
+        result = _modbus_call(client.read_discrete_inputs, address=base, count=count)
+        if result.isError():
+            print(f"[MODBUS] Sensor read error: {result}")
+            return None, None
+        sensor1_on = bool(result.bits[SENSOR1_INPUT_ADDR - base])
+        sensor2_on = bool(result.bits[SENSOR2_INPUT_ADDR - base])
+        return sensor1_on, sensor2_on
+    except Exception as e:
+        print(f"[MODBUS] Sensor read exception: {e}")
+        return None, None
+
+
+def send_stop_signal():
+    """Write the stop-machine coil ON, then OFF after STOP_SIGNAL_PULSE_MS -
+    the Modbus TCP equivalent of pulsing the mechanical relay you used before."""
+    client = get_modbus_client()
+    if client is None:
+        print("[MODBUS] Cannot send stop signal - no connection. "
+              "Check MODBUS_HOST/MODBUS_PORT and that pymodbus is installed.")
+        return
+    try:
+        _modbus_call(client.write_coil, STOP_SIGNAL_COIL_ADDR, True)
+        print(f"[MODBUS] Stop signal ON (coil {STOP_SIGNAL_COIL_ADDR})")
+
+        def _release_stop_signal():
+            try:
+                _modbus_call(client.write_coil, STOP_SIGNAL_COIL_ADDR, False)
+                print(f"[MODBUS] Stop signal OFF (coil {STOP_SIGNAL_COIL_ADDR})")
+            except Exception as e:
+                print(f"[MODBUS] Error releasing stop signal: {e}")
+
+        root.after(STOP_SIGNAL_PULSE_MS, _release_stop_signal)
+    except Exception as e:
+        print(f"[MODBUS] Error sending stop signal: {e}")
+
+
+def load_model_for_package(package_type):
+    """Load (or fetch from cache) the YOLO detection model for a given package type.
+    Returns (model_or_None, class_names_dict, error_message_or_None)."""
+    if package_type in loaded_models:
+        model = loaded_models[package_type]
+        return model, model.names, None
+
+    model_path = MODEL_PATHS.get(package_type)
+    if model_path is None:
+        return None, {}, f"No model path configured for '{package_type}'"
+
+    if not os.path.exists(model_path):
+        return None, {}, f"Model file not found:\n{model_path}"
+
+    try:
+        print(f"[SETUP] Loading model for {package_type} from: {model_path}")
+        model = YOLO(model_path)
+        dummy_frame = np.zeros((640, 640, 3), dtype=np.uint8)
+        model.predict(dummy_frame, verbose=False)  # warm-up
+        loaded_models[package_type] = model
+        print(f"[SETUP] {package_type} model ready. Classes: {model.names}")
+        return model, model.names, None
+    except Exception as e:
+        return None, {}, f"Could not load model:\n{e}"
+
+
+# ---------------- Helper Functions ----------------
+
+def get_roi_crop(frame):
+    """Return (cropped_frame, x_offset, y_offset) for the current ROI region.
+    x_offset/y_offset let us translate box coordinates back to the full frame later."""
+    if not USE_ROI:
+        return frame, 0, 0
+
+    h, w = frame.shape[:2]
+    x0 = int(w * ROI_LEFT)
+    y0 = int(h * ROI_TOP)
+    x1 = int(w * ROI_RIGHT)
+    y1 = int(h * ROI_BOTTOM)
+    cropped = frame[y0:y1, x0:x1]
+    return cropped, x0, y0
+
+
+def detect_all_units(frame):
+    """Run the current package's YOLO DETECTION model on a frame and return
+    EVERY detected unit above the confidence threshold (not just the top-1).
+
+    Returns (units, inference_time_seconds) where units is a list of dicts:
+    [{"label": str, "confidence": float, "is_good": bool,
+      "box_xyxy": (x1,y1,x2,y2)}, ...]
+    Box coordinates are in the ORIGINAL (uncropped) frame's coordinate space.
+    inference_time_seconds measures ONLY the model.predict() call, so you can
+    see the model's raw processing speed separately from drawing/saving overhead.
+    """
+    roi_frame, x_offset, y_offset = get_roi_crop(frame)
+
+    inference_start = time.time()
+    # agnostic_nms=True suppresses overlapping boxes across DIFFERENT classes too,
+    # not just within the same class. Without this, two classes (e.g. BROKEN LEAD
+    # and GOOD LEAD) can both fire on the same physical lead and both survive,
+    # inflating the unit count and muddying the good/bad tally.
+    results = current_model.predict(roi_frame, verbose=False, agnostic_nms=True)
+    inference_time = time.time() - inference_start
+
+    r = results[0]
+
+    if DEBUG_LOG_ALL_DETECTIONS:
+        if r.boxes is None or len(r.boxes) == 0:
+            print("[DEBUG] Raw model output: 0 boxes detected at all (before threshold filtering)")
+        else:
+            print(f"[DEBUG] Raw model output: {len(r.boxes)} box(es) before threshold filtering "
+                  f"(CLASS_CONF_THRESHOLD = {CLASS_CONF_THRESHOLD}):")
+            for box in r.boxes:
+                conf = float(box.conf[0])
+                cls_idx = int(box.cls[0])
+                lbl = current_model_classes.get(cls_idx, str(cls_idx))
+                flag = "" if conf >= CLASS_CONF_THRESHOLD else "  <-- BELOW THRESHOLD, discarded"
+                print(f"[DEBUG]   {lbl:20s} conf={conf:.3f}{flag}")
+
+    units = []
+    if r.boxes is None or len(r.boxes) == 0:
+        return units, inference_time
+
+    for box in r.boxes:
+        confidence = float(box.conf[0])
+        if confidence < CLASS_CONF_THRESHOLD:
+            continue  # too low confidence, ignore this detection entirely
+
+        cls_idx = int(box.cls[0])
+        label = current_model_classes.get(cls_idx, str(cls_idx))
+        is_good = is_good_label(label)
+
+        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+        # translate ROI-relative coordinates back to full-frame coordinates
+        box_xyxy = (x1 + x_offset, y1 + y_offset, x2 + x_offset, y2 + y_offset)
+
+        units.append({
+            "label": label,
+            "confidence": confidence,
+            "is_good": is_good,
+            "box_xyxy": box_xyxy,
+        })
+
+    return units, inference_time
+
+
+def build_class_breakdown_lines(units):
+    """Group detected units by category (Orientation vs Lead, or anything else
+    by its raw label) and return short summary lines, e.g.
+    'Orientation: 2 Good / 0 Wrong' and 'Lead: 4 Good / 2 Broken'.
+    This is what makes broken/wrong counts visible even when they don't flip
+    the single overall GOOD/NG verdict the way you'd expect at a glance."""
+    orientation_good = orientation_bad = 0
+    lead_good = lead_bad = 0
+    other_counts = {}  # label -> [good_count, bad_count], for any class that
+                        # doesn't match "orientation" or "lead" in its name
+
+    for u in units:
+        label_lower = u["label"].lower()
+        if "orientation" in label_lower:
+            if u["is_good"]:
+                orientation_good += 1
+            else:
+                orientation_bad += 1
+        elif "lead" in label_lower:
+            if u["is_good"]:
+                lead_good += 1
+            else:
+                lead_bad += 1
+        else:
+            counts = other_counts.setdefault(u["label"], [0, 0])
+            counts[0 if u["is_good"] else 1] += 1
+
+    lines = []
+    if orientation_good or orientation_bad:
+        lines.append(f"Orientation: {orientation_good} Good / {orientation_bad} Wrong")
+    if lead_good or lead_bad:
+        lines.append(f"Lead: {lead_good} Good / {lead_bad} Broken")
+    for label, (g, b) in other_counts.items():
+        lines.append(f"{label}: {g} Good / {b} Bad")
+    return lines
+
+
+def annotate_frame_multi(frame, units, overall_result_text, breakdown_lines, overall_color):
+    """Draw a box + label for EVERY detected unit, plus a compact result banner
+    (solid background, not overlaid transparently on the image) showing the
+    overall verdict AND a per-class breakdown so defect counts are never hidden
+    behind a single good/bad tally."""
+    annotated = frame.copy()
+
+    for unit in units:
+        x1, y1, x2, y2 = unit["box_xyxy"]
+        color = get_class_color(unit["label"], unit["is_good"])
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 3)
+        label_text = f"{unit['label']} ({unit['confidence']*100:.0f}%)"
+        cv2.putText(annotated, label_text, (x1, max(20, y1 - 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+    # Draw the ROI boundary for visual reference, if enabled AND visibility is on
+    if USE_ROI and SHOW_ROI_OVERLAY:
+        h, w = annotated.shape[:2]
+        x0, y0 = int(w * ROI_LEFT), int(h * ROI_TOP)
+        x1, y1 = int(w * ROI_RIGHT), int(h * ROI_BOTTOM)
+        cv2.rectangle(annotated, (x0, y0), (x1, y1), (255, 255, 0), 1)
+
+    # ---- Compact result banner, solid background, bottom-left ----
+    banner_lines = [overall_result_text] + breakdown_lines
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.55   # kept small on purpose - "not too big"
+    thickness = 1
+    line_height = 22
+    padding = 8
+
+    max_text_w = 0
+    for line in banner_lines:
+        (tw, _th), _ = cv2.getTextSize(line, font, font_scale, thickness)
+        max_text_w = max(max_text_w, tw)
+
+    box_w = max_text_w + padding * 2
+    box_h = line_height * len(banner_lines) + padding * 2
+    box_x = 20
+    box_y = annotated.shape[0] - box_h - 20
+
+    # SOLID (fully opaque) background so the text stays legible over any
+    # busy image content behind it - filled rectangle, then a thin colored border.
+    cv2.rectangle(annotated, (box_x, box_y), (box_x + box_w, box_y + box_h), (0, 0, 0), -1)
+    cv2.rectangle(annotated, (box_x, box_y), (box_x + box_w, box_y + box_h), overall_color, 2)
+
+    for i, line in enumerate(banner_lines):
+        text_color = overall_color if i == 0 else (255, 255, 255)
+        text_y = box_y + padding + line_height * (i + 1) - 6
+        cv2.putText(annotated, line, (box_x + padding, text_y),
+                    font, font_scale, text_color, thickness, cv2.LINE_AA)
+
+    if selected_package:
+        cv2.putText(annotated, f"Package: {selected_package}", (30, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+    return annotated
+
+
+def save_result_image(frame_annotated, is_good, timestamp):
+    """Save the annotated frame into <BASE_DIRECTORY>/<LotNumber>/GOOD or NG,
+    matching the required folder structure, e.g.
+    C:\\Users\\EOLmaint\\Documents\\Python\\123456.7\\GOOD"""
+    good_dir, ng_dir = get_lot_save_dirs(current_lot_number)
+    target_dir = good_dir if is_good else ng_dir
+    tag = "GOOD" if is_good else "NG"
+    filename = f"{selected_package}_{tag}_{timestamp}.jpg"
+    save_path = os.path.join(target_dir, filename)
+    cv2.imwrite(save_path, frame_annotated)
+    print(f"[SAVE] {save_path}")
+    return save_path
+
+
+def should_save_image(overall_is_good, units):
+    """Decide whether this result should be written to disk, based on the
+    Settings panel checkboxes (SAVE_GOOD_IMAGES, SAVE_NG_IMAGES, SAVE_CLASS_FLAGS).
+    Saves if the overall result matches an enabled toggle, OR if any individually
+    detected unit matches an enabled per-class toggle."""
+    if overall_is_good and SAVE_GOOD_IMAGES:
+        return True
+    if not overall_is_good and SAVE_NG_IMAGES:
+        return True
+    for u in units:
+        if SAVE_CLASS_FLAGS.get(u["label"], False):
+            return True
+    return False
+
+
+def classify_and_save(raw_frame):
+    """Run the YOLO detection pipeline on a single captured frame, detect ALL units,
+    determine an overall GOOD/NG result, and save it."""
+    global good_count, ng_count, last_result, last_reason
+    global result_frame_display, result_freeze_until, last_process_time
+    global last_inference_time, last_fps
+
+    if selected_package is None:
+        messagebox.showwarning("Selection Required", "Please select a package type first!")
+        return
+
+    start = time.time()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    inference_time = 0.0
+
+    if current_model is None:
+        annotated = annotate_frame_multi(raw_frame, [], "NG", ["Model Not Loaded For This Package"], (0, 0, 255))
+        if should_save_image(False, []):
+            save_result_image(annotated, is_good=False, timestamp=timestamp)
+        else:
+            print("[SAVE] Skipped (NG saving disabled in Settings)")
+        last_result = "NG"
+        last_reason = "Model not loaded"
+        ng_count += 1
+    else:
+        units, inference_time = detect_all_units(raw_frame)
+
+        if len(units) == 0:
+            overall_is_good = False
+            overall_result_text = "NG"
+            breakdown_lines = ["No Units Detected"]
+            last_reason = "No units detected"
+        else:
+            # Overall result is GOOD only if EVERY detected unit is good.
+            # If ANY unit is NG/WRONG/BROKEN, the whole package is NG.
+            overall_is_good = all(u["is_good"] for u in units)
+            good_units = sum(1 for u in units if u["is_good"])
+            bad_units = len(units) - good_units
+
+            breakdown_lines = build_class_breakdown_lines(units)
+
+            if len(units) < EXPECTED_UNITS_PER_FRAME:
+                last_reason = (f"{len(units)}/{EXPECTED_UNITS_PER_FRAME} units detected "
+                                f"({good_units} good, {bad_units} bad)")
+            else:
+                last_reason = f"{good_units} good, {bad_units} bad (of {len(units)} units)"
+
+            overall_result_text = "GOOD" if overall_is_good else "NG"
+
+        color = (0, 200, 0) if overall_is_good else (0, 0, 255)
+        annotated = annotate_frame_multi(raw_frame, units, overall_result_text, breakdown_lines, color)
+        if should_save_image(overall_is_good, units):
+            save_result_image(annotated, is_good=overall_is_good, timestamp=timestamp)
+        else:
+            print("[SAVE] Skipped (disabled for this result type in Settings)")
+
+        last_result = "GOOD" if overall_is_good else "NG"
+
+        if overall_is_good:
+            good_count += 1
+        else:
+            ng_count += 1
+            # Trigger the stop-machine output signal (Modbus TCP coil) - the
+            # replacement for the mechanical relay used previously.
+            send_stop_signal()
+
+    last_process_time = time.time() - start
+    last_inference_time = inference_time
+    last_fps = 1.0 / inference_time if inference_time > 0 else 0.0
+    result_frame_display = annotated
+    result_freeze_until = time.time() + RESULT_DISPLAY_SECONDS
+
+    print(f"[RESULT] {last_result} - {last_reason} "
+          f"(inference: {last_inference_time*1000:.1f}ms / {last_fps:.1f} FPS, "
+          f"total: {last_process_time:.3f}s)")
+
+    update_led()
+    update_status_display()
+
+
+# ---------------- GUI Functions ----------------
+
+def start_system():
+    """Validate Operator ID + Lot Number, then start the automatic sensor-driven
+    detection sequence. Requires a package/model to already be selected."""
+    global current_operator_id, current_lot_number, SYSTEM_RUNNING
+    global _prev_snap_condition, _lot_finished_prompt_open, _both_off_since
+
+    operator_id = operator_id_var.get().strip()
+    lot_number = lot_number_var.get().strip()
+
+    if not operator_id or not lot_number:
+        messagebox.showwarning("Missing Information", "Please enter both Operator ID and Lot Number.")
+        return
+    if current_model is None:
+        messagebox.showwarning("Selection Required", "Please select a package type first!")
+        return
+
+    current_operator_id = operator_id
+    current_lot_number = lot_number
+    SYSTEM_RUNNING = True
+    _prev_snap_condition = False
+    _lot_finished_prompt_open = False
+    _both_off_since = None
+
+    operator_id_entry.config(state='disabled')
+    lot_number_entry.config(state='disabled')
+    package_combo.config(state='disabled')
+    confirm_btn.config(state='disabled')
+    start_btn.config(state='disabled')
+    stop_btn.config(state='normal')
+    run_status_label.config(
+        text=f"RUNNING  -  Operator: {current_operator_id}   Lot: {current_lot_number}",
+        foreground='#00aa00')
+
+    print(f"[SYSTEM] Started. Operator={current_operator_id} Lot={current_lot_number}")
+    poll_sensors()
+
+
+def stop_system(triggered_by_lot_finished=False):
+    """Stop the automatic detection sequence and return to idle. Per the
+    required sequence, Operator ID / Lot Number must be re-entered to resume,
+    so those fields are cleared here."""
+    global current_operator_id, current_lot_number, SYSTEM_RUNNING, _sensor_poll_job
+
+    SYSTEM_RUNNING = False
+    if _sensor_poll_job is not None:
+        root.after_cancel(_sensor_poll_job)
+        _sensor_poll_job = None
+
+    current_operator_id = None
+    current_lot_number = None
+    operator_id_var.set("")
+    lot_number_var.set("")
+
+    operator_id_entry.config(state='normal')
+    lot_number_entry.config(state='normal')
+    package_combo.config(state='readonly')
+    confirm_btn.config(state='normal')
+    start_btn.config(state='normal')
+    stop_btn.config(state='disabled')
+
+    reason = "Lot Finished" if triggered_by_lot_finished else "Stopped by operator"
+    run_status_label.config(
+        text=f"IDLE  ({reason})  -  Enter Operator ID and Lot Number to resume",
+        foreground='gray')
+
+    print(f"[SYSTEM] Stopped. Reason={reason}")
+
+
+def ask_lot_finished():
+    """Show the 'LOT IS FINISHED?' confirmation. YES -> go idle (per spec).
+    NO -> keep running, waiting for the next leadframe."""
+    global _lot_finished_prompt_open, _both_off_since
+    answer = messagebox.askyesno("Lot Status", "LOT IS FINISHED?")
+    if answer:
+        stop_system(triggered_by_lot_finished=True)
+    _lot_finished_prompt_open = False
+    _both_off_since = None  # restart the hold timer fresh either way
+
+
+def poll_sensors():
+    """Runs every SENSOR_POLL_INTERVAL_MS while SYSTEM_RUNNING. Implements:
+      - Sensor1 OFF, Sensor2 ON  -> snap + process (rising-edge triggered once)
+      - Sensor1 ON,  Sensor2 ON  -> do nothing (leadframe still loading)
+      - Sensor1 OFF, Sensor2 OFF -> if this holds continuously for
+        BOTH_OFF_HOLD_SECONDS, ask 'LOT IS FINISHED?' (a brief gap between
+        leadframes should NOT immediately trigger the prompt)
+      - Sensor1 ON,  Sensor2 OFF -> not specified in the sequence; treated as
+        'wait, no action' - flag this with EOL Assembly if that's not correct.
+    """
+    global _prev_snap_condition, _lot_finished_prompt_open, _sensor_poll_job, _both_off_since
+
+    if not SYSTEM_RUNNING:
+        return  # stop rescheduling - the loop ends naturally once stopped
+
+    if not _lot_finished_prompt_open:
+        sensor1_on, sensor2_on = read_sensors()
+
+        if sensor1_on is None or sensor2_on is None:
+            pass  # comms issue this cycle - skip acting, try again next poll
+        else:
+            condition_snap = (not sensor1_on) and sensor2_on
+            condition_lot_finished = (not sensor1_on) and (not sensor2_on)
+
+            if condition_snap:
+                if not _prev_snap_condition and gui_lock_frame is not None:
+                    classify_and_save(gui_lock_frame.copy())
+                _prev_snap_condition = True
+                _both_off_since = None  # sensors are active again, reset the hold timer
+            else:
+                _prev_snap_condition = False
+                if condition_lot_finished:
+                    if _both_off_since is None:
+                        _both_off_since = time.time()  # start timing this "both OFF" spell
+                    elif time.time() - _both_off_since >= BOTH_OFF_HOLD_SECONDS:
+                        _lot_finished_prompt_open = True
+                        ask_lot_finished()
+                        # _both_off_since reset happens after the prompt is answered,
+                        # inside ask_lot_finished(), so a "NO" answer doesn't
+                        # immediately re-trigger the prompt on the very next poll
+                else:
+                    # sensor1 ON + sensor2 ON (still loading), or sensor1 ON + sensor2 OFF
+                    # (unspecified case) - neither counts as "both off", so reset the timer.
+                    _both_off_since = None
+                # sensor1 ON + sensor2 ON (still loading), or sensor1 ON + sensor2 OFF
+                # (unspecified case) both fall through here with no action taken.
+
+    _sensor_poll_job = root.after(SENSOR_POLL_INTERVAL_MS, poll_sensors)
+
+
+def select_package_type():
+    global selected_package, current_model, current_model_classes
+    selected = package_var.get()
+    if selected == "-- Select Package Type --":
+        messagebox.showwarning("Selection Required", "Please select a package type first!")
+        return
+
+    selected_package = selected
+    print(f"\n[PACKAGE] Selected: {selected_package}")
+    package_label.config(text=f"Loading model for {selected_package}...", foreground='#cc8800')
+    root.update_idletasks()  # show the "loading" text immediately, model load can take a moment
+
+    model, class_names, error = load_model_for_package(selected_package)
+    current_model = model
+    current_model_classes = class_names
+
+    if error:
+        package_label.config(text=f"Active Package: {selected_package} (MODEL ERROR)", foreground='#cc0000')
+        snap_btn.config(state='disabled')
+        messagebox.showerror("Model Load Error",
+                              f"Could not load the model for '{selected_package}':\n\n{error}\n\n"
+                              f"Check MODEL_PATHS at the top of the script.")
+        return
+
+    package_label.config(text=f"Active Package: {selected_package}", foreground='#0066cc')
+    snap_btn.config(state='normal')
+    build_class_save_checkboxes(current_model_classes)
+    messagebox.showinfo("Package Selected",
+                        f"Package type '{selected_package}' selected.\n"
+                        f"Model classes: {current_model_classes}\n\n"
+                        f"Images will save under:\n{BASE_DIRECTORY}\\<Lot Number>\\GOOD\\ or NG\\\n\n"
+                        "Enter your Operator ID and Lot Number, then click START to begin.")
+
+
+def reset_stats():
+    global good_count, ng_count, last_result, last_reason
+    if messagebox.askyesno("Reset", "Reset Good/NG counters?"):
+        good_count = 0
+        ng_count = 0
+        last_result = None
+        last_reason = ""
+        update_status_display()
+        update_led()
+
+
+def on_snap_key(event=None):
+    """Triggered by pressing 'S' or clicking the SNAP button."""
+    global gui_lock_frame
+    if gui_lock_frame is None:
+        return
+    frame_copy = gui_lock_frame.copy()
+    classify_and_save(frame_copy)
+
+
+def apply_settings():
+    global CLASS_CONF_THRESHOLD
+    try:
+        new_conf = float(class_conf_var.get())
+        if not (0.05 <= new_conf <= 1.0):
+            messagebox.showerror("Invalid Input", "Confidence threshold must be between 0.05 and 1.0")
+            return
+        CLASS_CONF_THRESHOLD = new_conf
+        current_values_label.config(text=f"Active: Confidence Threshold = {CLASS_CONF_THRESHOLD:.2f}")
+        messagebox.showinfo("Settings Applied", "New settings applied successfully!")
+    except ValueError as e:
+        messagebox.showerror("Invalid Input", f"Please enter a valid numeric value:\n{e}")
+
+
+def toggle_save_good():
+    """Called when the 'GOOD packages' checkbox is ticked/unticked."""
+    global SAVE_GOOD_IMAGES
+    SAVE_GOOD_IMAGES = save_good_var.get()
+
+
+def toggle_save_ng():
+    """Called when the 'NG packages' checkbox is ticked/unticked."""
+    global SAVE_NG_IMAGES
+    SAVE_NG_IMAGES = save_ng_var.get()
+
+
+def toggle_show_roi():
+    """Called when the 'Show ROI boundary on screen' checkbox is ticked/unticked."""
+    global SHOW_ROI_OVERLAY
+    SHOW_ROI_OVERLAY = show_roi_var.get()
+
+
+def toggle_class_save(label):
+    """Called when a per-class 'always save if this class appears' checkbox changes."""
+    SAVE_CLASS_FLAGS[label] = class_save_vars[label].get()
+
+
+def build_class_save_checkboxes(class_names_dict):
+    """Rebuild the per-class save checkboxes to match the currently loaded
+    model's classes. Called each time a package (and its model) is selected,
+    since different packages can have different class sets."""
+    global class_save_vars
+
+    # Clear any checkboxes left over from a previously selected package
+    for child in class_save_frame.winfo_children():
+        child.destroy()
+    class_save_vars = {}
+    SAVE_CLASS_FLAGS.clear()
+
+    for label in class_names_dict.values():
+        var = tk.BooleanVar(value=False)
+        class_save_vars[label] = var
+        SAVE_CLASS_FLAGS[label] = False
+        ttk.Checkbutton(
+            class_save_frame, text=label, variable=var,
+            command=lambda lbl=label: toggle_class_save(lbl)
+        ).pack(anchor="w")
+
+
+def prompt_roi_login():
+    """Show a small modal login dialog. If the entered credentials match
+    ROI_ADMIN_USERNAME / ROI_ADMIN_PASSWORD, open the ROI adjustment window."""
+    login_win = tk.Toplevel(root)
+    login_win.title("Admin Login Required")
+    login_win.minsize(340, 240)
+    login_win.geometry("340x260")
+    login_win.grab_set()  # modal - blocks interaction with the main window until closed
+
+    ttk.Label(login_win, text="Adjusting the ROI requires admin login",
+              font=('Arial', 12, 'bold'), wraplength=300, justify='center').pack(pady=(15, 10))
+
+    form = ttk.Frame(login_win)
+    form.pack(pady=5)
+    ttk.Label(form, text="Username:", font=('Arial', 11)).grid(row=0, column=0, sticky=tk.E, padx=5, pady=5)
+    username_var = tk.StringVar()
+    username_entry = ttk.Entry(form, textvariable=username_var, width=20)
+    username_entry.grid(row=0, column=1, padx=5, pady=5)
+
+    ttk.Label(form, text="Password:", font=('Arial', 11)).grid(row=1, column=0, sticky=tk.E, padx=5, pady=5)
+    password_var = tk.StringVar()
+    password_entry = ttk.Entry(form, textvariable=password_var, width=20, show="*")
+    password_entry.grid(row=1, column=1, padx=5, pady=5)
+
+    error_label = ttk.Label(login_win, text="", foreground="#cc0000", font=('Arial', 10))
+    error_label.pack()
+
+    def try_login(event=None):
+        if username_var.get() == ROI_ADMIN_USERNAME and password_var.get() == ROI_ADMIN_PASSWORD:
+            login_win.destroy()
+            open_roi_adjustment_window()
+        else:
+            error_label.config(text="Incorrect username or password.")
+            password_var.set("")
+            password_entry.focus_set()
+
+    btn_frame_login = ttk.Frame(login_win)
+    btn_frame_login.pack(side=tk.BOTTOM, pady=15)
+    ttk.Button(btn_frame_login, text="Login", command=try_login).pack(side=tk.LEFT, padx=5)
+    ttk.Button(btn_frame_login, text="Cancel", command=login_win.destroy).pack(side=tk.LEFT, padx=5)
+
+    login_win.bind('<Return>', try_login)
+    username_entry.focus_set()
+
+
+def open_roi_adjustment_window():
+    """Admin-only window to manually adjust the ROI boundaries, with a live
+    preview of the camera feed showing the boundary update as sliders move.
+    Changes only take effect on the running app - and get written to disk -
+    when 'Save ROI' is clicked. 'Cancel' discards them."""
+    adj_win = tk.Toplevel(root)
+    adj_win.title("Adjust ROI (Admin)")
+    adj_win.minsize(700, 500)
+    adj_win.geometry("780x760")
+
+    preview_job = {"id": None}
+
+    def on_close():
+        if preview_job["id"] is not None:
+            adj_win.after_cancel(preview_job["id"])
+        adj_win.destroy()
+
+    adj_win.protocol("WM_DELETE_WINDOW", on_close)
+    adj_win.grab_set()
+
+    # Pack the Save/Cancel button bar at the BOTTOM first, before anything else
+    # is packed above it. This reserves that space permanently, so the buttons
+    # can never get pushed off-screen or clipped no matter how tall the sliders/
+    # preview content above ends up being.
+    btn_frame_adj = ttk.Frame(adj_win)
+    btn_frame_adj.pack(side=tk.BOTTOM, fill=tk.X, pady=15)
+
+    # Everything else below goes ABOVE the button bar, filling remaining space.
+    content_frame = ttk.Frame(adj_win)
+    content_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+    ttk.Label(content_frame, text="Adjust ROI Boundaries", font=('Arial', 14, 'bold')).pack(pady=(10, 2))
+    ttk.Label(content_frame, text="Drag each slider - the yellow box on the preview below updates live.",
+              font=('Arial', 10, 'italic'), foreground='gray').pack(pady=(0, 10))
+
+    preview_label = ttk.Label(content_frame)
+    preview_label.pack(pady=5)
+
+    # Local working values (percent, 0-100) - only committed to the global
+    # ROI_LEFT/TOP/RIGHT/BOTTOM (and saved to disk) when "Save ROI" is clicked.
+    left_var = tk.DoubleVar(value=ROI_LEFT * 100)
+    top_var = tk.DoubleVar(value=ROI_TOP * 100)
+    right_var = tk.DoubleVar(value=ROI_RIGHT * 100)
+    bottom_var = tk.DoubleVar(value=ROI_BOTTOM * 100)
+
+    sliders_frame = ttk.Frame(content_frame)
+    sliders_frame.pack(fill=tk.X, padx=25, pady=10)
+    sliders_frame.columnconfigure(1, weight=1)
+
+    value_labels = {}
+
+    def make_slider(label_text, var, row):
+        ttk.Label(sliders_frame, text=label_text, font=('Arial', 11)).grid(
+            row=row, column=0, sticky=tk.W, pady=8)
+        ttk.Scale(sliders_frame, from_=0, to=100, orient=tk.HORIZONTAL, variable=var,
+                  command=lambda v: refresh_preview()).grid(row=row, column=1, sticky=tk.EW, padx=10)
+        val_lbl = ttk.Label(sliders_frame, text=f"{var.get():.0f}%", width=6)
+        val_lbl.grid(row=row, column=2)
+        value_labels[label_text] = val_lbl
+
+    make_slider("Left edge:", left_var, 0)
+    make_slider("Top edge:", top_var, 1)
+    make_slider("Right edge:", right_var, 2)
+    make_slider("Bottom edge:", bottom_var, 3)
+
+    warning_label = ttk.Label(content_frame, text="", foreground="#cc0000", font=('Arial', 10))
+    warning_label.pack(pady=(5, 0))
+
+    def refresh_preview():
+        for txt, var in [("Left edge:", left_var), ("Top edge:", top_var),
+                          ("Right edge:", right_var), ("Bottom edge:", bottom_var)]:
+            value_labels[txt].config(text=f"{var.get():.0f}%")
+
+        l, t, r, b = left_var.get() / 100, top_var.get() / 100, right_var.get() / 100, bottom_var.get() / 100
+        if l >= r or t >= b:
+            warning_label.config(text="Left must be less than Right, and Top must be less than Bottom.")
+        else:
+            warning_label.config(text="")
+
+        if gui_lock_frame is not None:
+            frame = gui_lock_frame.copy()
+            h, w = frame.shape[:2]
+            x0, y0, x1, y1 = int(w * l), int(h * t), int(w * r), int(h * b)
+            cv2.rectangle(frame, (x0, y0), (x1, y1), (0, 255, 255), 2)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            disp_h = 360
+            disp_w = int(disp_h * (rgb.shape[1] / rgb.shape[0]))
+            rgb = cv2.resize(rgb, (disp_w, disp_h))
+            img = Image.fromarray(rgb)
+            imgtk = ImageTk.PhotoImage(image=img)
+            preview_label.imgtk = imgtk
+            preview_label.configure(image=imgtk)
+
+    def auto_refresh():
+        refresh_preview()
+        preview_job["id"] = adj_win.after(100, auto_refresh)
+
+    def do_save():
+        global ROI_LEFT, ROI_TOP, ROI_RIGHT, ROI_BOTTOM
+        l, t, r, b = left_var.get() / 100, top_var.get() / 100, right_var.get() / 100, bottom_var.get() / 100
+        if l >= r or t >= b:
+            messagebox.showerror("Invalid ROI", "Left must be less than Right, and Top must be less than Bottom.")
+            return
+        ROI_LEFT, ROI_TOP, ROI_RIGHT, ROI_BOTTOM = l, t, r, b
+        save_roi_config()
+        messagebox.showinfo("ROI Saved", "New ROI settings have been saved and applied.")
+        on_close()
+
+    ttk.Button(btn_frame_adj, text="✓ Save ROI", command=do_save,
+               style="Big.TButton").pack(side=tk.LEFT, padx=10, anchor="center")
+    ttk.Button(btn_frame_adj, text="Cancel", command=on_close,
+               style="Big.TButton").pack(side=tk.LEFT, padx=10, anchor="center")
+    # Center the button pair within the bottom bar
+    btn_frame_adj.pack_configure(anchor="center")
+
+    auto_refresh()
+
+
+def update_status_display():
+    stats_label.config(
+        text=f"Good: {good_count}   |   NG: {ng_count}   |   Total: {good_count + ng_count}"
+    )
+    if last_result:
+        color = '#00aa00' if last_result == "GOOD" else '#cc0000'
+        result_label.config(text=f"Last Result: {last_result}  ({last_reason})", foreground=color)
+    timing_label.config(
+        text=f"Inference: {last_inference_time*1000:.1f}ms ({last_fps:.1f} FPS)   |   "
+             f"Total processing: {last_process_time:.3f}s"
+    )
+
+
+def update_led():
+    """Update the dummy GREEN/RED LED indicators."""
+    if last_result == "GOOD":
+        led_canvas.itemconfig(green_led, fill="#00ff00", outline="#006600")
+        led_canvas.itemconfig(red_led, fill="#330000", outline="#550000")
+    elif last_result == "NG":
+        led_canvas.itemconfig(green_led, fill="#003300", outline="#006600")
+        led_canvas.itemconfig(red_led, fill="#ff0000", outline="#550000")
+    else:
+        led_canvas.itemconfig(green_led, fill="#003300", outline="#006600")
+        led_canvas.itemconfig(red_led, fill="#330000", outline="#550000")
+
+
+def update_live_preview():
+    """Continuously grab frames from the webcam and display either the live feed
+    or a frozen result frame (right after a snap)."""
+    global gui_lock_frame, result_frame_display
+
+    if video_capture is not None and video_capture.isOpened():
+        ret, frame = video_capture.read()
+        if ret:
+            gui_lock_frame = frame
+
+    now = time.time()
+    if now < result_freeze_until and result_frame_display is not None:
+        display_frame = result_frame_display
+    else:
+        if gui_lock_frame is not None:
+            preview = gui_lock_frame.copy()
+            if selected_package:
+                cv2.putText(preview, f"Package: {selected_package}", (30, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+            else:
+                cv2.putText(preview, "Select a package type ->", (30, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 165, 255), 2)
+            cv2.putText(preview, "LIVE - Press 'S' to snap", (30, preview.shape[0] - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+            # Show the ROI boundary in the live preview too, if enabled AND visibility is on
+            if USE_ROI and SHOW_ROI_OVERLAY:
+                h, w = preview.shape[:2]
+                x0, y0 = int(w * ROI_LEFT), int(h * ROI_TOP)
+                x1, y1 = int(w * ROI_RIGHT), int(h * ROI_BOTTOM)
+                cv2.rectangle(preview, (x0, y0), (x1, y1), (255, 255, 0), 1)
+
+            display_frame = preview
+        else:
+            display_frame = None
+
+    if display_frame is not None:
+        rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+        display_height = 600
+        aspect_ratio = rgb.shape[1] / rgb.shape[0]
+        display_width = int(display_height * aspect_ratio)
+        rgb = cv2.resize(rgb, (display_width, display_height))
+        img = Image.fromarray(rgb)
+        imgtk = ImageTk.PhotoImage(image=img)
+        video_label.imgtk = imgtk
+        video_label.configure(image=imgtk)
+
+    root.after(33, update_live_preview)
+
+
+def on_close():
+    if video_capture is not None:
+        video_capture.release()
+    root.destroy()
+
+
+def create_gui():
+    global root, video_label, stats_label, result_label, timing_label
+    global class_conf_var
+    global package_var, current_values_label, package_label
+    global snap_btn, led_canvas, green_led, red_led
+    global save_good_var, save_ng_var, show_roi_var, class_save_frame
+    global operator_id_var, lot_number_var, operator_id_entry, lot_number_entry
+    global start_btn, stop_btn, run_status_label, package_combo, confirm_btn
+
+    root = tk.Tk()
+    root.title("Package Good/NG Tester (Per-Package YOLO Detection - Laptop / Thonny - No IO)")
+    root.geometry("1600x950")
+
+    big_font = font.Font(size=15, weight="bold")
+    entry_font = font.Font(size=14, weight="bold")
+    combo_font = font.Font(size=14, weight="bold")
+
+    style = ttk.Style()
+    style.configure("Big.TButton", font=big_font, padding=10)
+    style.configure("Snap.TButton", font=big_font, padding=12)
+
+    main_container = ttk.PanedWindow(root, orient=tk.HORIZONTAL)
+    main_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+    # ===== LEFT PANEL =====
+    left_panel = ttk.Frame(main_container)
+    main_container.add(left_panel, weight=7)
+
+    # Package Selection
+    ttk.Label(left_panel, text="Package Type Selection",
+              font=("Segoe UI", 15, "bold italic")).pack(anchor="nw", padx=10, pady=(0, 2))
+
+    package_frame = ttk.Frame(left_panel, relief="groove", borderwidth=2, padding=10)
+    package_frame.pack(fill=tk.X, padx=5, pady=(0, 5))
+
+    ttk.Label(package_frame, text="Select Package Type:",
+              font=('Arial', 15)).pack(side=tk.LEFT, padx=5)
+
+    package_var = tk.StringVar(value="-- Select Package Type --")
+    package_combo = ttk.Combobox(package_frame, textvariable=package_var,
+                                  values=["-- Select Package Type --"] + list(MODEL_PATHS.keys()),
+                                  state='readonly', width=20, font=combo_font)
+    package_combo.pack(side=tk.LEFT, padx=5)
+
+    confirm_btn = ttk.Button(package_frame, text="Confirm Selection",
+                              command=select_package_type, style="Big.TButton")
+    confirm_btn.pack(side=tk.LEFT, padx=5)
+
+    package_label = ttk.Label(package_frame, text="No package selected",
+                               font=('Arial', 13), foreground='gray')
+    package_label.pack(side=tk.LEFT, padx=15)
+
+    # ===== Operator & Lot Control =====
+    ttk.Label(left_panel, text="Operator & Lot Control",
+              font=("Segoe UI", 15, "bold italic")).pack(anchor="nw", padx=10, pady=(10, 2))
+
+    lot_frame = ttk.Frame(left_panel, relief="groove", borderwidth=2, padding=10)
+    lot_frame.pack(fill=tk.X, padx=5, pady=(0, 5))
+
+    ttk.Label(lot_frame, text="Operator ID:", font=('Arial', 13)).grid(
+        row=0, column=0, sticky=tk.W, padx=5, pady=5)
+    operator_id_var = tk.StringVar()
+    operator_id_entry = ttk.Entry(lot_frame, textvariable=operator_id_var, width=16, font=('Arial', 13))
+    operator_id_entry.grid(row=0, column=1, padx=5, pady=5)
+
+    ttk.Label(lot_frame, text="Lot Number:", font=('Arial', 13)).grid(
+        row=0, column=2, sticky=tk.W, padx=(20, 5), pady=5)
+    lot_number_var = tk.StringVar()
+    lot_number_entry = ttk.Entry(lot_frame, textvariable=lot_number_var, width=16, font=('Arial', 13))
+    lot_number_entry.grid(row=0, column=3, padx=5, pady=5)
+
+    start_btn = ttk.Button(lot_frame, text="▶ START", command=start_system, style="Big.TButton")
+    start_btn.grid(row=0, column=4, padx=(20, 5), pady=5)
+    stop_btn = ttk.Button(lot_frame, text="■ STOP", command=stop_system, style="Big.TButton", state='disabled')
+    stop_btn.grid(row=0, column=5, padx=5, pady=5)
+
+    run_status_label = ttk.Label(
+        lot_frame, text="IDLE  -  Enter Operator ID and Lot Number, then click START",
+        font=('Arial', 12, 'bold'), foreground='gray')
+    run_status_label.grid(row=1, column=0, columnspan=6, sticky=tk.W, padx=5, pady=(8, 0))
+
+    # Control Frame (Snap + Reset + LED)
+    ttk.Label(left_panel, text="Test Control",
+              font=("Segoe UI", 15, "bold italic")).pack(anchor="nw", padx=10, pady=(10, 2))
+
+    control_frame = ttk.Frame(left_panel, relief="groove", borderwidth=2, padding=5)
+    control_frame.pack(fill=tk.X, padx=5, pady=(0, 5))
+
+    btn_frame = ttk.Frame(control_frame)
+    btn_frame.pack(side=tk.LEFT, padx=5)
+
+    snap_btn = ttk.Button(btn_frame, text="SNAP (S)", command=on_snap_key,
+                           width=15, style="Snap.TButton", state='disabled')
+    snap_btn.pack(side=tk.LEFT, padx=3)
+
+    ttk.Button(btn_frame, text="RESET COUNTS", command=reset_stats,
+               width=15, style="Big.TButton").pack(side=tk.LEFT, padx=3)
+
+    # Dummy LED indicators
+    led_frame = ttk.Frame(control_frame)
+    led_frame.pack(side=tk.LEFT, padx=30)
+
+    ttk.Label(led_frame, text="Output Indicator:", font=('Arial', 13)).pack(side=tk.LEFT, padx=(0, 10))
+
+    led_canvas = tk.Canvas(led_frame, width=180, height=60, highlightthickness=0, bg='#f0f0f0')
+    led_canvas.pack(side=tk.LEFT)
+    green_led = led_canvas.create_oval(10, 10, 60, 60, fill="#003300", outline="#006600", width=2)
+    red_led = led_canvas.create_oval(100, 10, 150, 60, fill="#330000", outline="#550000", width=2)
+    led_canvas.create_text(35, 68, text="GOOD", font=('Arial', 9, 'bold'))
+    led_canvas.create_text(125, 68, text="NG", font=('Arial', 9, 'bold'))
+
+    result_label = ttk.Label(control_frame, text="Last Result: --",
+                              font=('Arial', 16, 'bold'), foreground='gray')
+    result_label.pack(side=tk.LEFT, padx=20)
+
+    # Video Display
+    ttk.Label(left_panel, text="Live View",
+              font=("Segoe UI", 15, "bold italic")).pack(anchor="nw", padx=10, pady=(10, 2))
+
+    video_frame = ttk.Frame(left_panel, relief="groove", borderwidth=2, padding=5)
+    video_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=5, pady=(0, 5))
+
+    video_label = ttk.Label(video_frame)
+    video_label.pack()
+
+    # Statistics
+    stats_frame = ttk.Frame(left_panel, relief="groove", borderwidth=2, padding=10)
+    stats_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=(0, 5))
+
+    stats_label = ttk.Label(stats_frame, text="Good: 0   |   NG: 0   |   Total: 0",
+                             font=('Arial', 15))
+    stats_label.pack(side=tk.LEFT, padx=5)
+
+    timing_label = ttk.Label(stats_frame, text="Last process time: 0.000s",
+                              font=('Arial', 13), foreground='gray')
+    timing_label.pack(side=tk.LEFT, padx=15)
+
+    # ===== RIGHT PANEL =====
+    right_panel = ttk.Frame(main_container)
+    main_container.add(right_panel, weight=3)
+
+    ttk.Label(right_panel, text="Classification Settings",
+              font=("Segoe UI", 15, "bold italic")).pack(anchor="nw", padx=10, pady=(5, 2))
+
+    settings_frame = ttk.Frame(right_panel, relief="groove", borderwidth=2, padding=10)
+    settings_frame.pack(fill=tk.X, padx=5, pady=(0, 5))
+
+    row = 0
+    ttk.Label(settings_frame, text="Confidence Threshold:",
+              font=('Arial', 15)).grid(row=row, column=0, sticky=tk.W, pady=5)
+    class_conf_var = tk.StringVar(value=str(CLASS_CONF_THRESHOLD))
+    ttk.Entry(settings_frame, textvariable=class_conf_var,
+              width=12, font=entry_font).grid(row=row, column=1, padx=5)
+    ttk.Label(settings_frame, text="(0.05 - 1.0)",
+              font=('Arial', 15), foreground='gray').grid(row=row, column=2, sticky=tk.W)
+
+    row += 1
+    ttk.Button(settings_frame, text="✓ Apply Settings", command=apply_settings,
+               width=20, style="Big.TButton").grid(row=row, column=0, columnspan=3, pady=15)
+
+    row += 1
+    ttk.Separator(settings_frame, orient='horizontal').grid(row=row, column=0,
+                                                             columnspan=3, sticky=tk.EW, pady=5)
+    row += 1
+    current_values_label = ttk.Label(
+        settings_frame,
+        text=f"Active: Confidence Threshold = {CLASS_CONF_THRESHOLD:.2f}",
+        font=('Arial', 13), foreground='#0066cc', wraplength=300)
+    current_values_label.grid(row=row, column=0, columnspan=3, pady=5)
+
+    row += 1
+    ttk.Separator(settings_frame, orient='horizontal').grid(row=row, column=0,
+                                                             columnspan=3, sticky=tk.EW, pady=5)
+
+    # ---- Image saving options ----
+    row += 1
+    ttk.Label(settings_frame, text="Save Images For:",
+              font=('Arial', 14, 'bold')).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(5, 2))
+
+    save_good_var = tk.BooleanVar(value=SAVE_GOOD_IMAGES)
+    save_ng_var = tk.BooleanVar(value=SAVE_NG_IMAGES)
+
+    row += 1
+    ttk.Checkbutton(settings_frame, text="GOOD packages", variable=save_good_var,
+                     command=toggle_save_good).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=2)
+    row += 1
+    ttk.Checkbutton(settings_frame, text="NG packages", variable=save_ng_var,
+                     command=toggle_save_ng).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=2)
+
+    row += 1
+    ttk.Label(settings_frame, text="Always save if this specific class appears:",
+              font=('Arial', 11, 'italic'), foreground='gray').grid(
+        row=row, column=0, columnspan=3, sticky=tk.W, pady=(6, 2))
+
+    row += 1
+    class_save_frame = ttk.Frame(settings_frame)
+    class_save_frame.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=2)
+    # Populated dynamically in select_package_type() once a model's classes are known.
+
+    row += 1
+    ttk.Separator(settings_frame, orient='horizontal').grid(row=row, column=0,
+                                                             columnspan=3, sticky=tk.EW, pady=5)
+
+    # ---- ROI display option + admin adjustment ----
+    row += 1
+    show_roi_var = tk.BooleanVar(value=SHOW_ROI_OVERLAY)
+    ttk.Checkbutton(settings_frame, text="Show ROI boundary on screen", variable=show_roi_var,
+                     command=toggle_show_roi).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=2)
+
+    row += 1
+    ttk.Button(settings_frame, text="🔒 Adjust ROI", command=prompt_roi_login,
+               width=20).grid(row=row, column=0, columnspan=3, pady=(8, 2))
+
+    # System Info
+    ttk.Label(right_panel, text="System Information",
+              font=("Segoe UI", 15, "bold italic")).pack(anchor="nw", padx=10, pady=(5, 2))
+
+    info_frame = ttk.Frame(right_panel, relief="groove", borderwidth=2, padding=10)
+    info_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=(0, 5))
+
+    model_paths_text = "\n".join(
+        f"• {pkg}: {os.path.abspath(path)}" for pkg, path in MODEL_PATHS.items()
+    )
+
+    info_text = (
+        f"Camera index: {CAMERA_INDEX}\n"
+        f"Models load automatically\n"
+        f"when you select a package.\n\n"
+        f"ROI enabled: {USE_ROI}\n"
+        f"ROI bounds: L{ROI_LEFT*100:.0f}% T{ROI_TOP*100:.0f}% "
+        f"R{ROI_RIGHT*100:.0f}% B{ROI_BOTTOM*100:.0f}%\n"
+        f"Expected units/frame: {EXPECTED_UNITS_PER_FRAME}\n\n"
+        f"Modbus TCP IO: {MODBUS_HOST}:{MODBUS_PORT}\n"
+        f"Sensor1=DI8(addr{SENSOR1_INPUT_ADDR}) Sensor2=DI7(addr{SENSOR2_INPUT_ADDR})\n"
+        f"Both-OFF hold: {BOTH_OFF_HOLD_SECONDS}s before Lot Finished prompt\n"
+        f"Stop coil={STOP_SIGNAL_COIL_ADDR}\n"
+        f"(pymodbus installed: {PYMODBUS_AVAILABLE})\n\n"
+        f"Configured model paths:\n"
+        f"{model_paths_text}\n\n"
+        f"Images save under:\n{os.path.abspath(BASE_DIRECTORY)}\\<Lot>\\GOOD or NG\\\n\n"
+        f"SEQUENCE:\n"
+        f"1. Select package type\n"
+        f"2. Enter Operator ID + Lot Number\n"
+        f"3. Click START\n"
+        f"4. Sensor1 OFF + Sensor2 ON\n"
+        f"   -> auto snap + process\n"
+        f"5. Both sensors OFF for\n"
+        f"   {BOTH_OFF_HOLD_SECONDS}s straight ->\n"
+        f"   'LOT IS FINISHED?' prompt\n"
+        f"6. NG result -> stop signal\n"
+        f"   sent via Modbus coil\n\n"
+        f"SNAP (S) button = manual\n"
+        f"override / simulation mode,\n"
+        f"still works independently."
+    )
+
+    ttk.Label(info_frame, text=info_text, font=('Courier', 11),
+              justify=tk.LEFT, foreground='#333').pack(anchor=tk.W)
+
+    # Bind 'S' / 's' key globally to snap
+    root.bind('<KeyPress-s>', on_snap_key)
+    root.bind('<KeyPress-S>', on_snap_key)
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    root.after(33, update_live_preview)
+
+    return root
+
+
+# ---------------- Main Execution ----------------
+
+if __name__ == "__main__":
+    try:
+        video_capture = cv2.VideoCapture(CAMERA_INDEX)
+        video_capture.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+        video_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+
+        if not video_capture.isOpened():
+            print(f"[ERROR] Could not open camera index {CAMERA_INDEX}. "
+                  f"Try changing CAMERA_INDEX at the top of the script.")
+
+        root = create_gui()
+        update_status_display()
+        update_led()
+
+        print("Package Good/NG Tester started.")
+        print("Select a package type, aim the camera, then press 'S' to test.")
+        root.mainloop()
+
+    except KeyboardInterrupt:
+        print("\nProgram stopped by user.")
+    except Exception as e:
+        print(f"\nAn error occurred: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        try:
+            if video_capture is not None:
+                video_capture.release()
+        except Exception:
+            pass
+        print("Camera released. Exiting.")
